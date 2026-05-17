@@ -7,14 +7,14 @@ For now, this project is **deletion only**. It lists sessions from a local Codex
 ## Usage
 
 ```bash
-chmod +x codex-session
-./codex-session
+chmod +x codex-sessions
+./codex-sessions
 ```
 
 To point it at a specific Codex home:
 
 ```bash
-CODEX_HOME=/path/to/.codex ./codex-session
+CODEX_HOME=/path/to/.codex ./codex-sessions
 ```
 
 On WSL, this can be used against a Windows Codex Desktop home by setting `CODEX_HOME` to the mounted Windows `.codex` directory.
