@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+import json
+import os
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+def default_codex_home() -> Path:
+    env_home = os.environ.get("CODEX_HOME")
+    if env_home:
+        return Path(env_home).expanduser()
+
+    candidates = [Path.home() / ".codex"]
+
+    windows_users = Path("/mnt/c/Users")
+    if windows_users.exists():
+        candidates.extend(path / ".codex" for path in windows_users.iterdir() if path.is_dir())
+
+    existing = [path for path in candidates if path.exists()]
+    if len(existing) == 1:
+        return existing[0]
+
+    return Path.home() / ".codex"
+
+
+CODEX_HOME = default_codex_home()
+INDEX = CODEX_HOME / "session_index.jsonl"
+SESSION_DIRS = [CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"]
+
+
+def load_index():
+    if not INDEX.exists():
+        return []
+
+    rows = []
+    for line_no, line in enumerate(INDEX.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"Skipping invalid JSON on line {line_no}", file=sys.stderr)
+            continue
+        item["_line_no"] = line_no
+        rows.append(item)
+    return rows
+
+
+def find_session_files(session_id):
+    matches = []
+    for root in SESSION_DIRS:
+        if root.exists():
+            matches.extend(root.rglob(f"*{session_id}*.jsonl"))
+    return sorted(matches)
+
+
+def scan_session_files():
+    rows = []
+    seen = set()
+    for root in SESSION_DIRS:
+        if not root.exists():
+            continue
+        files = sorted(root.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in files:
+            stem = path.stem
+            sid = stem.split("-")[-1] if "-" in stem else stem
+            if sid in seen:
+                continue
+            seen.add(sid)
+            rows.append({
+                "id": sid,
+                "thread_name": path.name,
+                "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+                "_file": str(path),
+            })
+    return rows
+
+
+def short_time(value):
+    if not value:
+        return "unknown time"
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return value
+
+
+def main():
+    rows = load_index()
+    using_index = bool(rows)
+    if not rows:
+        rows = scan_session_files()
+
+    if not rows:
+        print(f"No Codex sessions found under: {CODEX_HOME}")
+        return 0
+
+    print(f"\nCodex home: {CODEX_HOME}")
+    print("\nCodex sessions:\n")
+    for i, item in enumerate(rows, 1):
+        sid = item.get("id", "")
+        name = item.get("thread_name") or "(untitled)"
+        updated = short_time(item.get("updated_at"))
+        files = [Path(item["_file"])] if item.get("_file") else find_session_files(sid)
+        location = "archived" if any("archived_sessions" in str(p) for p in files) else "active"
+        print(f"{i:>3}. {updated}  {location:<8}  {name}  [{sid[:8]}]")
+
+    print("\nEnter a number to delete, or q to quit.")
+    choice = input("> ").strip().lower()
+    if choice in {"", "q", "quit", "exit"}:
+        print("No changes made.")
+        return 0
+
+    try:
+        selected = rows[int(choice) - 1]
+    except (ValueError, IndexError):
+        print("Invalid selection.", file=sys.stderr)
+        return 1
+
+    sid = selected.get("id")
+    name = selected.get("thread_name") or "(untitled)"
+    if not sid:
+        print("Selected entry has no id; refusing to delete.", file=sys.stderr)
+        return 1
+
+    files = [Path(selected["_file"])] if selected.get("_file") else find_session_files(sid)
+    print(f"\nSelected: {name} [{sid}]")
+    for path in files:
+        print(f"  will delete: {path}")
+    if not files and using_index:
+        print("  no matching session file found; will only remove index entry")
+
+    confirm = input("\nType DELETE to confirm: ").strip()
+    if confirm != "DELETE":
+        print("No changes made.")
+        return 0
+
+    backup = None
+    if using_index:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = INDEX.with_name(f"session_index.jsonl.bak-{stamp}")
+        shutil.copy2(INDEX, backup)
+
+        remaining = [item for item in rows if item.get("id") != sid]
+        tmp = INDEX.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as fh:
+            for item in remaining:
+                item.pop("_line_no", None)
+                item.pop("_file", None)
+                fh.write(json.dumps(item, separators=(",", ":")) + "\n")
+        os.replace(tmp, INDEX)
+
+    deleted = 0
+    for path in files:
+        try:
+            path.unlink()
+            deleted += 1
+        except FileNotFoundError:
+            pass
+
+    print(f"\nDeleted {deleted} session file(s).")
+    if using_index:
+        print(f"Removed index entry for: {name}")
+        print(f"Index backup: {backup}")
+    else:
+        print("No session index was present, so only session files were touched.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
