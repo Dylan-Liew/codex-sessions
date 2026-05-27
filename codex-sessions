@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -28,6 +29,9 @@ def default_codex_home() -> Path:
 CODEX_HOME = default_codex_home()
 INDEX = CODEX_HOME / "session_index.jsonl"
 SESSION_DIRS = [CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"]
+SESSION_ID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 
 
 def load_index():
@@ -44,8 +48,79 @@ def load_index():
             print(f"Skipping invalid JSON on line {line_no}", file=sys.stderr)
             continue
         item["_line_no"] = line_no
+        item["_from_index"] = True
         rows.append(item)
     return rows
+
+
+def session_id_from_path(path):
+    match = SESSION_ID_RE.search(path.stem)
+    if match:
+        return match.group(0)
+    return path.stem
+
+
+def message_content_text(content):
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    parts = []
+    for item in content:
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+    return "\n".join(parts)
+
+
+def clean_thread_name(text):
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    if not lines:
+        return ""
+    if lines[0].startswith("<environment_context>"):
+        return ""
+    return lines[0]
+
+
+def session_file_info(path):
+    info = {"id": session_id_from_path(path), "thread_name": ""}
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line_no, line in enumerate(fh, 1):
+                if line_no > 500:
+                    break
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+                if item.get("type") == "session_meta":
+                    if isinstance(payload.get("id"), str):
+                        info["id"] = payload["id"]
+                    cwd = payload.get("cwd")
+                    if isinstance(cwd, str) and not info["thread_name"]:
+                        info["thread_name"] = Path(cwd).name.replace("-", " ")
+                    continue
+
+                text = ""
+                if item.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    text = payload.get("message", "")
+                elif item.get("type") == "response_item":
+                    if payload.get("type") == "message" and payload.get("role") == "user":
+                        text = message_content_text(payload.get("content"))
+
+                name = clean_thread_name(text)
+                if name:
+                    info["thread_name"] = name
+                    break
+    except OSError:
+        pass
+
+    if not info["thread_name"]:
+        info["thread_name"] = path.name
+    return info
 
 
 def find_session_files(session_id):
@@ -64,18 +139,50 @@ def scan_session_files():
             continue
         files = sorted(root.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
         for path in files:
-            stem = path.stem
-            sid = stem.split("-")[-1] if "-" in stem else stem
+            info = session_file_info(path)
+            sid = info["id"]
             if sid in seen:
                 continue
             seen.add(sid)
             rows.append({
                 "id": sid,
-                "thread_name": path.name,
-                "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+                "thread_name": info["thread_name"],
+                "updated_at": datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(),
                 "_file": str(path),
+                "_from_index": False,
             })
     return rows
+
+
+def merge_sessions(index_rows, file_rows):
+    rows = []
+    seen_ids = set()
+
+    for item in index_rows:
+        sid = item.get("id")
+        if sid:
+            seen_ids.add(sid)
+        rows.append(item)
+
+    for item in file_rows:
+        sid = item.get("id")
+        if sid and sid in seen_ids:
+            continue
+        if sid:
+            seen_ids.add(sid)
+        rows.append(item)
+
+    return sorted(rows, key=session_sort_time, reverse=True)
+
+
+def session_sort_time(item):
+    value = item.get("updated_at")
+    if not value:
+        return 0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0
 
 
 def short_time(value):
@@ -88,10 +195,10 @@ def short_time(value):
 
 
 def main():
-    rows = load_index()
-    using_index = bool(rows)
-    if not rows:
-        rows = scan_session_files()
+    index_rows = load_index()
+    file_rows = scan_session_files()
+    using_index = bool(index_rows)
+    rows = merge_sessions(index_rows, file_rows)
 
     if not rows:
         print(f"No Codex sessions found under: {CODEX_HOME}")
@@ -138,17 +245,18 @@ def main():
         return 0
 
     backup = None
-    if using_index:
+    if using_index and selected.get("_from_index"):
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         backup = INDEX.with_name(f"session_index.jsonl.bak-{stamp}")
         shutil.copy2(INDEX, backup)
 
-        remaining = [item for item in rows if item.get("id") != sid]
+        remaining = [item for item in index_rows if item.get("id") != sid]
         tmp = INDEX.with_suffix(".jsonl.tmp")
         with tmp.open("w", encoding="utf-8", newline="\n") as fh:
             for item in remaining:
                 item.pop("_line_no", None)
                 item.pop("_file", None)
+                item.pop("_from_index", None)
                 fh.write(json.dumps(item, separators=(",", ":")) + "\n")
         os.replace(tmp, INDEX)
 
@@ -161,11 +269,11 @@ def main():
             pass
 
     print(f"\nDeleted {deleted} session file(s).")
-    if using_index:
+    if backup:
         print(f"Removed index entry for: {name}")
         print(f"Index backup: {backup}")
     else:
-        print("No session index was present, so only session files were touched.")
+        print("Only session files were touched.")
     return 0
 
 
